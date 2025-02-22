@@ -3,7 +3,7 @@
             [clojure.spec.alpha :as spec]
             [clojure.string :as s]
             [ring.util.response :as resp]
-            [taoensso.timbre :as timbre :refer [trace debug warn error]])
+            [taoensso.timbre :as timbre :refer [trace tracef debug warn error]])
   (:import [java.time LocalDateTime]))
 
 (def ^:private max-requests 10)
@@ -59,12 +59,13 @@
    (ok nil)))
 
 (defn- accepted
-  ([content-location body]
+  ([content-location-uri location-uri body]
    (-> (resp/response body)
        (resp/status 202)
-       (resp/header "Content-Location" content-location)))
-  ([content-location]
-   (accepted content-location nil)))
+       (resp/header "Content-Location" content-location-uri)
+       (resp/header "Location" location-uri)))
+  ([content-location-uri location-uri]
+   (accepted content-location-uri location-uri nil)))
 
 (defn- not-found [uri-or-page-name]
   (-> (resp/not-found (str "Not found " uri-or-page-name))
@@ -81,34 +82,77 @@
 
 ;; endregion
 
+(def job-status-route-pattern-str "/job/([a-fA-F0-9\\-]+?)/status/?")
+
+(defn- matches-job-status-route?
+  ([uri route-prefix]
+   (let [pattern (re-pattern (str route-prefix job-status-route-pattern-str))]
+     (re-find pattern uri)))
+  ([uri]
+   (matches-job-status-route? uri "")))
+
+(def job-resource-route-pattern-str "/job/([a-fA-F0-9\\-]+)/?")
+
+(defn- matches-job-resource-route?
+  ([uri route-prefix]
+   (let [pattern (re-pattern (str route-prefix job-resource-route-pattern-str))]
+     (re-find pattern uri)))
+  ([uri]
+   (matches-job-resource-route? uri "")))
+
 (defn- handle-state-request [{:keys [::server-state] :as _request}]
   (ok (get @server-state :state)))
 
 (defn- handle-history-request [{:keys [::server-state] :as _request}]
   (ok (get-in @server-state [:state :history])))
 
-(defn- handle-jobs [{:keys [params ::server-state] :as request}]
+(defn- handle-jobs [{:keys [params ::server-state ::route-prefix] :as request}]
   (let [{job-domain "jobDomain"
          job-type "jobType"} params]
-    (if (and job-domain job-type)
-      (let [job {:id (random-uuid)
+    (if-not (and job-domain job-type)
+      (bad-request (merge {:job-domain job-domain
+                           :job-type job-type}
+                          {:message "jobDomain and jobType are required"}))
+      (let [job-id (random-uuid)
+            job {:id job-id
                  :type (keyword job-domain job-type)
                  :params params}
             input-chan (get-in @server-state [:server :input-chan])]
+        (tracef "[handle-jobs] handling posted job %s <<<" job-id)
+        (tracef "[handle-jobs] offering job %s <<<" job-id)
         (if (a/offer! input-chan job)
-          (let [{:keys [scheme server-name server-port]} request
-                job-url (format "%s://%s:%s/api/job/status/%s" (name scheme) server-name server-port (:id job))]
-            (accepted job-url {"jobId" (:id job)}))
+          (let [record-new-job (fn []
+                                 (let [timestamp (LocalDateTime/now)]
+                                   (tracef "[handle-jobs]   inserting pending job %s" job-id)
+                                   (swap! server-state update-in [:state :pending] conj {:job-id job-id
+                                                                                         :job-type job-type
+                                                                                         :accept-time (str timestamp)})))
+                create-response (fn []
+                                  (let [{:keys [scheme server-name server-port]} request
+                                        job-status-url (format "%s://%s:%s%s/job/%s/status" (name scheme) server-name server-port route-prefix job-id)
+                                        job-resource-url (format "%s://%s:%s%s/job/%s" (name scheme) server-name server-port route-prefix job-id)]
+                                    (println "route-prefix" route-prefix)
+                                    (accepted job-status-url job-resource-url {"jobId" job-id})))]
+            (record-new-job)
+            (create-response))
           (do
-            (warn "failed to enqueue job; jobDomain=%s; jobType=%s" job-domain job-type)
-            (server-busy))))
-      (bad-request (merge {:job-domain job-domain
-                           :job-type job-type}
-                          {:message "jobDomain and jobType are required"})))))
+            (warn "[handle-jobs] failed to offer job; jobDomain=%s; jobType=%s" job-domain job-type)
+            (server-busy)))))))
+
+(defn- handle-job-request [{:keys [uri ::server-state] :as _request}]
+  (let [match (matches-job-resource-route? uri)
+        job-id (get match 1)]
+
+    (if-let [executor-output (->> (get-in @server-state [:state :history])
+                                  (some (fn [job] (and (= job-id (str (:job-id job))) job)))
+                                  (:executor-output))]
+      (ok {:job-id job-id
+           :job-output executor-output})
+      (not-found {:job-id job-id}))))
 
 (defn- handle-job-status-request [{:keys [uri ::server-state] :as _request}]
-  (let [tokens (s/split uri #"/")
-        job-id (last tokens)
+  (let [match (matches-job-status-route? uri)
+        job-id (get match 1)
         {{:keys [pending history]} :state} @server-state
         job (cond
               (some (fn [{id :job-id}] (= (str id) job-id)) pending)
@@ -125,6 +169,7 @@
 
 (def ^:private routes {:api-state {:get #'handle-state-request}
                        :api-history {:get #'handle-history-request}
+                       :api-job {:get #'handle-job-request}
                        :api-job-status {:get #'handle-job-status-request}
                        :api-jobs {:post #'handle-jobs}})
 
@@ -136,8 +181,11 @@
     (= uri (str route-prefix "/history"))
     :api-history
 
-    (.startsWith uri (str route-prefix "/job/status"))
+    (matches-job-status-route? uri route-prefix)
     :api-job-status
+
+    (matches-job-resource-route? uri route-prefix)
+    :api-job
 
     (= uri (str route-prefix "/jobs"))
     :api-jobs
@@ -153,17 +201,22 @@
                     (get method))]
     handler))
 
-(defn- create-input-process [input-chan req-chan state-chan]
-  (a/go-loop []
-    (when-some [job (a/<! input-chan)]
-      (let [{job-id :id
-             job-type :type} job]
-        (a/>! state-chan {:operation :input
-                          :job-id job-id
-                          :job-type job-type
-                          :timestamp (LocalDateTime/now)})
-        (a/>! req-chan job))
-      (recur))))
+(defn- create-process [f queue-chan admin-chan]
+  (a/thread
+    (loop []
+      (let [[work source-chan] (a/alts!! [admin-chan queue-chan] :priority true)]
+        (when (and (= queue-chan source-chan)
+                   (not (nil? work)))
+          (f work)
+          (recur))))))
+
+(defn- create-input-process [input-chan admin-chan worker-chan]
+  (let [f (fn [{job-id :id :as job}]
+            (tracef "[input-process] handling %s" job-id)
+            (tracef "[input-process]   blocking put to worker-chan")
+            (a/>!! worker-chan job)
+            (tracef "[input-process] handling %s complete" job-id))]
+    (create-process f input-chan admin-chan)))
 
 (defn- do-job [{:keys [id executor args] :as job}]
   (try
@@ -179,172 +232,165 @@
        :job-status :job/failure
        :exception exception})))
 
-(defn- create-worker-process [worker-chan worker-cancel-chan state-chan job-mapping]
-  (a/go-loop []
-    (let [[work source-chan] (a/alts! [worker-cancel-chan worker-chan] :priority true)]
-      (when (= worker-chan source-chan)
-        (let [{:keys [id type params]} work]
-          ;; update job state to :started
-          (a/>! state-chan {:operation :started
-                            :job-id id
-                            :timestamp (LocalDateTime/now)})
-          (let [_ (trace "destructure job mapping")
-                {:keys [extract-args executor]} (get job-mapping type)
-                _ (trace "extracting args")
-                args (try (extract-args params) (catch Exception _ {}))
-                _ (trace "building job")
-                job {:id id
-                     :executor executor
-                     :args args}
+(defn- create-worker-process [worker-chan admin-chan state-chan job-mapping]
+  (let [f (fn [work]
+            (let [{:keys [id type params]} work]
+              (tracef "[worker-process] handling %s" id)
+              ;; update job state to :started
+              (trace "[worker-process]   blocking put (:started) to state-chan")
+              (a/>!! state-chan {:operation :started
+                                 :job-id id
+                                 :timestamp (LocalDateTime/now)})
+              (tracef "[worker-process]   resuming %s" id)
+              (let [{:keys [extract-args executor]} (get job-mapping type)
+                    args (try (extract-args params) (catch Exception _ {}))
+                    job {:id id
+                         :executor executor
+                         :args args}
 
-                _ (trace "doing job")
-                _ (trace job)
+                    ;; run job
+                    _ (tracef "[worker-proces]   executing job %s" id)
+                    result (do-job job)
+                    _ (tracef "[worker-process]   job %s complete" id)]
+                ;; update job state to :completed
+                (tracef "[worker-process]   blocking put (:complete) to state-chan")
+                (a/>!! state-chan (assoc result
+                                         :operation :completed
+                                         :timestamp (LocalDateTime/now)))
+                (tracef "[worker-process] handling %s complete" id))))]
+    (create-process f worker-chan admin-chan)))
 
-                ;; run job
-                result (a/<! (a/thread (do-job job)))
-                _ (trace "job complete")]
-            ;; update job state to :completed
-            (a/>! state-chan (assoc result
-                                    :operation :completed
-                                    :timestamp (LocalDateTime/now)))
-            (recur)))))))
+(defn- create-state-process [state-chan admin-chan server-state-ref]
+  (let [f (fn [{:keys [job-id] :as result}]
+            (let [pending-job?
+                  (fn [job-id x] (= job-id (:job-id x)))
 
-(defn- create-state-process [state-chan server-state-ref]
-  (let [pending-job?
-        (fn [job-id x] (= job-id (:job-id x)))
+                  find-pending-job
+                  (fn [job-id pending-jobs]
+                    (some (fn [x]
+                            (and (pending-job? job-id x)
+                                 x))
+                          pending-jobs))
 
-        find-pending-job
-        (fn [job-id pending-jobs]
-          (some (fn [x]
-                  (and (pending-job? job-id x)
-                       x))
-                pending-jobs))
+                  completed-proc-error-update
+                  (fn [{:keys [job-id job-args job-status timestamp] :as result} {:keys [pending history] :as state}]
+                    (let [exception (:exception result)
+                          exception-message (ex-message exception)
+                          pending-job (find-pending-job job-id (:pending state))
+                          {:keys [out err exit] :as _ex-data} (ex-data exception)
+                          out (when out (slurp out))
+                          err (when err (slurp err))]
+                      (-> state
+                          (assoc :pending (->> pending
+                                               (remove (partial pending-job? job-id))
+                                               (vec)))
+                          (assoc :history (conj history (cond-> (merge pending-job {:job-id job-id
+                                                                                    :job-status job-status
+                                                                                    :end-time (str timestamp)})
+                                                          (some? job-args) (assoc :job-args job-args)
+                                                          (some? exception-message) (assoc :exception-message exception-message)
+                                                          (some? exit) (assoc :exit exit)
+                                                          (some? out) (assoc :out out)
+                                                          (some? err) (assoc :err err)))))))
 
-        completed-proc-error-update
-        (fn [{:keys [job-id job-args job-status timestamp] :as result} {:keys [pending history] :as state}]
-          (let [exception (:exception result)
-                exception-message (ex-message exception)
-                pending-job (find-pending-job job-id (:pending state))
-                {:keys [out err exit] :as _ex-data} (ex-data exception)
-                out (when out (slurp out))
-                err (when err (slurp err))]
-            (-> state
-                (assoc :pending (->> pending
-                                     (remove (partial pending-job? job-id))
-                                     (vec)))
-                (assoc :history (conj history (cond-> (merge pending-job {:job-id job-id
-                                                                          :job-status job-status
-                                                                          :end-time (str timestamp)})
-                                                (some? job-args) (assoc :job-args job-args)
-                                                (some? exception-message) (assoc :exception-message exception-message)
-                                                (some? exit) (assoc :exit exit)
-                                                (some? out) (assoc :out out)
-                                                (some? err) (assoc :err err)))))))
+                  completed-error-update
+                  (fn [{:keys [job-id job-args job-status timestamp] :as result} {:keys [pending history] :as state}]
+                    (let [exception (:exception result)
+                          exception-message (ex-message exception)
+                          pending-job (find-pending-job job-id (:pending state))]
+                      (-> state
+                          (assoc :pending (->> pending
+                                               (remove (partial pending-job? job-id))
+                                               (vec)))
+                          (assoc :history (conj history (cond-> (merge pending-job {:job-id job-id
+                                                                                    :job-status job-status
+                                                                                    :end-time (str timestamp)})
+                                                          (some? job-args) (assoc :job-args job-args)
+                                                          (some? exception-message) (assoc :exception-message exception-message)))))))
 
-        completed-error-update
-        (fn [{:keys [job-id job-args job-status timestamp] :as result} {:keys [pending history] :as state}]
-          (let [exception (:exception result)
-                exception-message (ex-message exception)
-                pending-job (find-pending-job job-id (:pending state))]
-            (-> state
-                (assoc :pending (->> pending
-                                     (remove (partial pending-job? job-id))
-                                     (vec)))
-                (assoc :history (conj history (cond-> (merge pending-job {:job-id job-id
-                                                                          :job-status job-status
-                                                                          :end-time (str timestamp)})
-                                                (some? job-args) (assoc :job-args job-args)
-                                                (some? exception-message) (assoc :exception-message exception-message)))))))
+                  completed-success-update
+                  (fn [{:keys [job-id job-args job-status timestamp executor-output]} {:keys [pending history] :as state}]
+                    (let [pending-job (find-pending-job job-id (:pending state))]
+                      (-> state
+                          (assoc :pending (->> pending
+                                               (remove (partial pending-job? job-id))
+                                               (vec)))
+                          (assoc :history (conj history (cond-> (merge pending-job {:job-id job-id
+                                                                                    :job-status job-status
+                                                                                    :end-time (str timestamp)})
+                                                          job-args (assoc :job-args job-args)
+                                                          executor-output (assoc :executor-output executor-output)))))))]
 
-        completed-success-update
-        (fn [{:keys [job-id job-args job-status timestamp executor-output]} {:keys [pending history] :as state}]
-          (let [pending-job (find-pending-job job-id (:pending state))]
-            (-> state
-                (assoc :pending (->> pending
-                                     (remove (partial pending-job? job-id))
-                                     (vec)))
-                (assoc :history (conj history (cond-> (merge pending-job {:job-id job-id
-                                                                          :job-status job-status
-                                                                          :end-time (str timestamp)})
-                                                job-args (assoc :job-args job-args)
-                                                executor-output (assoc :executor-output executor-output)))))))]
-    (a/go-loop []
-      (when-some [{:keys [operation] :as result} (a/<! state-chan)]
-        (condp = operation
+              (tracef "[state-process] handling %s" job-id)
+              (condp = (:operation result)
 
-          :input
-          (let [{:keys [job-id job-type timestamp]} result]
-            (swap! server-state-ref update-in [:state :pending] conj {:job-id job-id
-                                                                      :job-type job-type
-                                                                      :accept-time (str timestamp)})
-            (recur))
+                :started
+                (let [{:keys [timestamp]} result]
+                  (tracef "[state-process]   updating job %s as :started" job-id)
+                  (swap! server-state-ref update-in [:state :pending] (fn [pending-jobs]
+                                                                        (->> pending-jobs
+                                                                             (mapv (fn [{pending-job-id :job-id :as pending-job}]
+                                                                                     (if (= job-id pending-job-id)
+                                                                                       (assoc pending-job :start-time (str timestamp))
+                                                                                       pending-job)))))))
 
-          :started
-          (let [{:keys [job-id timestamp]} result]
-            (swap! server-state-ref update-in [:state :pending] (fn [pending-jobs]
-                                                                  (->> pending-jobs
-                                                                       (mapv (fn [{pending-job-id :job-id :as pending-job}]
-                                                                               (if (= job-id pending-job-id)
-                                                                                 (assoc pending-job :start-time (str timestamp))
-                                                                                 pending-job))))))
-            (recur))
+                :completed
+                (let [{:keys [job-status]} result]
+                  (tracef "[state-process]   completing job %s as %s" job-id job-status)
+                  (cond
 
-          :completed
-          (let [{:keys [job-status]} result]
-            (cond
+                    ;; failure special case for bb.process/shell
+                    (and (= job-status :job/failure)
+                         (ex-data (:exception result)))
+                    (let [update-fn (partial completed-proc-error-update result)]
+                      (swap! server-state-ref update :state update-fn))
 
-              ;; failure special case for bb.process/shell
-              (and (= job-status :job/failure)
-                   (ex-data (:exception result)))
-              (let [update-fn (partial completed-proc-error-update result)]
-                (swap! server-state-ref update :state update-fn)
-                (recur))
+                    (= job-status :job/failure)
+                    (let [update-fn (partial completed-error-update result)]
+                      (swap! server-state-ref update :state update-fn))
 
-              (= job-status :job/failure)
-              (let [update-fn (partial completed-error-update result)]
-                (swap! server-state-ref update :state update-fn)
-                (recur))
+                    :else
+                    (let [update-fn (partial completed-success-update result)]
+                      (swap! server-state-ref update :state update-fn)))))
+              (tracef "[state-process] handling %s complete" job-id)))]
+    (create-process f state-chan admin-chan)))
 
-              :else
-              (let [update-fn (partial completed-success-update result)]
-                (swap! server-state-ref update :state update-fn)
-                (recur)))))))))
-
-(defn- create-stop-process [stop-chan input-chan worker-cancel-chan state-chan]
-  (a/go
-    (when-some [_ (a/<! stop-chan)]
-      (when input-chan (a/close! input-chan))
-      (a/put! worker-cancel-chan :close)
-      (a/close! state-chan))))
-
-(defn- handle-job [job-handler request server-state-ref]
-  (-> (assoc request ::server-state server-state-ref)
+(defn- handle-job [job-handler request server-state-ref route-prefix]
+  (-> request
+      (assoc ::server-state server-state-ref)
+      (assoc ::route-prefix route-prefix)
       (job-handler)))
 
+(defn- create-input-chan []
+  (a/chan max-requests))
+
 (defn- create-server-state-ref []
-  (atom {:server {:input-chan (a/chan max-requests)}
+  (atom {:server {:input-chan (create-input-chan)}
          :state {:pending []
                  :history []}}))
 
 (defn- handle-request [server-state-ref route-prefix handler request]
   (if-let [job-handler (request->handler request route-prefix)]
-    (handle-job job-handler request server-state-ref)
+    (handle-job job-handler request server-state-ref route-prefix)
     (handler request)))
 
 (defn wrap-job-server [handler job-mapping route-prefix stop-chan]
   (try-conform ::job-mapping job-mapping)
 
   (let [server-state-ref (create-server-state-ref)
-
+        admin-chan (a/mult stop-chan)
         input-chan (get-in @server-state-ref [:server :input-chan])
         worker-chan (a/chan max-jobs)
-        worker-cancel-chan (a/chan)
         state-chan (a/chan)]
 
-    (create-input-process input-chan worker-chan state-chan)
-    (create-worker-process worker-chan worker-cancel-chan state-chan job-mapping)
-    (create-state-process state-chan server-state-ref)
-    (create-stop-process stop-chan input-chan worker-cancel-chan state-chan)
+    (trace "creating input-process")
+    (create-input-process input-chan (a/tap admin-chan (a/chan)) worker-chan)
+
+    (trace "creating worker-process")
+    (create-worker-process worker-chan (a/tap admin-chan (a/chan)) state-chan job-mapping)
+
+    (trace "creating state-process")
+    (create-state-process state-chan (a/tap admin-chan (a/chan)) server-state-ref)
 
     (let [route-prefix (if (s/blank? route-prefix) "" route-prefix)]
       (partial handle-request server-state-ref route-prefix handler))))
