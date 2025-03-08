@@ -63,7 +63,8 @@
    (-> (resp/response body)
        (resp/status 202)
        (resp/header "Content-Location" content-location-uri)
-       (resp/header "Location" location-uri)))
+       (resp/header "Location" location-uri)
+       (resp/header "Access-Control-Expose-Headers" "Content-Location, Location")))
   ([content-location-uri location-uri]
    (accepted content-location-uri location-uri nil)))
 
