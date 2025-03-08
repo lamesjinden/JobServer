@@ -128,10 +128,19 @@
                                                                                          :job-type job-type
                                                                                          :accept-time (str timestamp)})))
                 create-response (fn []
-                                  (let [{:keys [scheme server-name server-port]} request
-                                        job-status-url (format "%s://%s:%s%s/job/%s/status" (name scheme) server-name server-port route-prefix job-id)
-                                        job-resource-url (format "%s://%s:%s%s/job/%s" (name scheme) server-name server-port route-prefix job-id)]
-                                    (println "route-prefix" route-prefix)
+                                  (let [->uri-parts (fn [{:keys [scheme server-name server-port] :as request}]
+                                                      {:scheme (or (get-in request [:headers "x-forwarded-proto"]) scheme)
+                                                       :server (or (get-in request [:headers "host"]) server-name)
+                                                       :port (or (get-in request [:headers "x-forwarded-port"]) server-port)})
+                                        ->uri (fn [{:keys [scheme server port] :as _uri-parts} path]
+                                                (let [port (if (and (= scheme "https") (= port "443"))
+                                                             ""
+                                                             port)]
+                                                  (format "%s://%s%s%s" scheme server port path)))
+
+                                        uri-parts (->uri-parts request)
+                                        job-status-url (->uri uri-parts (format "%s/job/%s/status" route-prefix job-id))
+                                        job-resource-url (->uri uri-parts (format "%s/job/%s" route-prefix job-id))]
                                     (accepted job-status-url job-resource-url {"jobId" job-id})))]
             (record-new-job)
             (create-response))
