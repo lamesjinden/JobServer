@@ -130,13 +130,13 @@
                                                                                          :accept-time (str timestamp)})))
                 create-response (fn []
                                   (let [->uri-parts (fn [{:keys [scheme server-name server-port] :as request}]
-                                                      {:scheme (or (get-in request [:headers "x-forwarded-proto"]) scheme)
-                                                       :server (or (get-in request [:headers "host"]) server-name)
-                                                       :port (or (get-in request [:headers "x-forwarded-port"]) server-port)})
+                                                      {:scheme (or (get-in request [:headers "x-forwarded-proto"]) (name scheme))
+                                                       :server (or (get-in request [:headers "x-forwarded-host"]) (str server-name))
+                                                       :port (or (get-in request [:headers "x-forwarded-port"]) (str server-port))})
                                         ->uri (fn [{:keys [scheme server port] :as _uri-parts} path]
                                                 (let [port (if (and (= scheme "https") (= port "443"))
                                                              ""
-                                                             port)]
+                                                             (str ":" port))]
                                                   (format "%s://%s%s%s" scheme server port path)))
 
                                         uri-parts (->uri-parts request)
