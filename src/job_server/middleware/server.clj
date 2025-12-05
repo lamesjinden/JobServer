@@ -259,7 +259,7 @@
                          :args args}
 
                     ;; run job
-                    _ (tracef "[worker-proces]   executing job %s" id)
+                    _ (tracef "[worker-process]   executing job %s" id)
                     result (do-job job)
                     _ (tracef "[worker-process]   job %s complete" id)]
                 ;; update job state to :completed
@@ -271,7 +271,13 @@
     (create-process f worker-chan admin-chan)))
 
 (defn- create-state-process [state-chan admin-chan server-state-ref]
-  (let [f (fn [{:keys [job-id] :as result}]
+  (let [try-slurp (fn [slurpable]
+                    (try
+                      (slurp slurpable)
+                      (catch Exception exception
+                        (tracef "attempt to slurp '%s' failed:" slurpable)
+                        (trace exception))))
+        f (fn [{:keys [job-id] :as result}]
             (let [pending-job?
                   (fn [job-id x] (= job-id (:job-id x)))
 
@@ -288,8 +294,10 @@
                           exception-message (ex-message exception)
                           pending-job (find-pending-job job-id (:pending state))
                           {:keys [out err exit] :as _ex-data} (ex-data exception)
-                          out (when out (slurp out))
-                          err (when err (slurp err))]
+                          out (or (when out (try-slurp out))
+                                  "< unable to read :out from ex-data >")
+                          err (or (when err (try-slurp err))
+                                  "< unable to read :err from ex-data >")]
                       (-> state
                           (assoc :pending (->> pending
                                                (remove (partial pending-job? job-id))
